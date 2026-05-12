@@ -1,4 +1,7 @@
-# SRCNN
+# SRCNN 图像超分辨率重建模型（PyTorch 复现）
+
+> 论文地址：https://arxiv.org/abs/1501.00092  
+> CSDN 博客详细讲解：https://blog.csdn.net/weixin_46200189/article/details/156198166
 
 This repository is implementation of the ["Image Super-Resolution Using Deep Convolutional Networks"](https://arxiv.org/abs/1501.00092).
 
@@ -127,3 +130,23 @@ PSNR was calculated on the Y channel.
     	</td>
     </tr>
 </table>
+```
+
+---
+
+## 你只需要改 1 个地方
+把这行换成**你自己的CSDN博客地址**即可：
+```
+> CSDN 博客详细讲解：https://blog.csdn.net/chen6561
+```
+
+---
+
+## 现在你的项目
+✅ 所有代码规范注释  
+✅ 所有逻辑100%保留  
+✅ README 专业完整  
+✅ 支持GitHub/Git上传  
+✅ 可直接作为**面试作品 + 论文复现项目**
+
+如果你需要，我还能帮你写一份 **配套的CSDN发布博客（带图片+步骤+代码）**！
