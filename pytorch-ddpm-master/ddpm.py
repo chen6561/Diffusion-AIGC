@@ -1,112 +1,154 @@
-import itertools
-
-import matplotlib.pyplot as plt
-import numpy as np
+# 导入PyTorch核心库
 import torch
-from PIL import Image
-from torch import nn
+# 导入神经网络模块
+import torch.nn as nn
+# 导入函数式API
+import torch.nn.functional as F
+# 导入配置类
+from config import DDPMConfig
+# 导入UNet模型主体
+from models import UNet
 
-from nets import (GaussianDiffusion, UNet, generate_cosine_schedule,
-                  generate_linear_schedule)
-from utils.utils import postprocess_output, show_config
 
+class DDPM(nn.Module):
+    """
+    DDPM（Denoising Diffusion Probabilistic Models）核心实现类
+    包含：前向扩散过程、反向采样过程、损失计算
+    """
 
-class Diffusion(object):
-    _defaults = {
-        #-----------------------------------------------#
-        #   model_path指向logs文件夹下的权值文件
-        #-----------------------------------------------#
-        "model_path"        : 'model_data/Diffusion_Flower.pth',
-        #-----------------------------------------------#
-        #   卷积通道数的设置
-        #-----------------------------------------------#
-        "channel"           : 128,
-        #-----------------------------------------------#
-        #   输入图像大小的设置
-        #-----------------------------------------------#
-        "input_shape"       : (32, 32),
-        #-----------------------------------------------#
-        #   betas相关参数
-        #-----------------------------------------------#
-        "schedule"          : "linear",
-        "num_timesteps"     : 1000,
-        "schedule_low"      : 1e-4,
-        "schedule_high"     : 0.02,
-        #-------------------------------#
-        #   是否使用Cuda
-        #   没有GPU可以设置成False
-        #-------------------------------#
-        "cuda"              : True,
-    }
+    def __init__(self, config: DDPMConfig):
+        """
+        初始化DDPM模型
+        :param config: 配置对象，包含所有超参数
+        """
+        super().__init__()
+        # 保存配置
+        self.config = config
+        # 初始化UNet模型，并移动到指定设备
+        self.model = UNet(config).to(config.device)
 
-    #---------------------------------------------------#
-    #   初始化Diffusion
-    #---------------------------------------------------#
-    def __init__(self, **kwargs):
-        self.__dict__.update(self._defaults)
-        for name, value in kwargs.items():
-            setattr(self, name, value)  
-            self._defaults[name] = value 
-        self.generate()
+        # ===================== 扩散过程参数预计算 =====================
+        # 生成线性递增的beta序列：从beta_start到beta_end，共num_timesteps步
+        self.betas = torch.linspace(
+            config.beta_start, config.beta_end, config.num_timesteps, device=config.device
+        )
+        # alpha = 1 - beta
+        self.alphas = 1.0 - self.betas
+        # alpha的累积乘积（bar_alpha_t）
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        # 上一时刻的累积alpha乘积，t=0时为1.0
+        self.alphas_cumprod_prev = torch.cat([
+            torch.tensor([1.0], device=config.device), self.alphas_cumprod[:-1]
+        ])
 
-        show_config(**self._defaults)
+        # ===================== 扩散过程常用系数预计算 =====================
+        # sqrt(bar_alpha_t)
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        # sqrt(1 - bar_alpha_t)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+        # log(1 - bar_alpha_t)
+        self.log_one_minus_alphas_cumprod = torch.log(1.0 - self.alphas_cumprod)
+        # sqrt(1 / bar_alpha_t)
+        self.sqrt_recip_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod)
+        # sqrt(1 / bar_alpha_t - 1)
+        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1)
 
-    def generate(self):
-        #----------------------------------------#
-        #   创建Diffusion模型
-        #----------------------------------------#
-        if self.schedule == "cosine":
-            betas = generate_cosine_schedule(self.num_timesteps)
-        else:
-            betas = generate_linear_schedule(
-                self.num_timesteps,
-                self.schedule_low * 1000 / self.num_timesteps,
-                self.schedule_high * 1000 / self.num_timesteps,
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None) -> torch.Tensor:
+        """
+        前向扩散过程（训练用）：从清晰图像x0逐步加噪得到xt
+        q(xt | x0) = N(xt; sqrt(bar_alpha_t)*x0, (1-bar_alpha_t)*I)
+        """
+        # 如果没有传入噪声，则生成标准正态噪声
+        if noise is None:
+            noise = torch.randn_like(x0)
+
+        # 提取当前批次对应时间步的系数，并reshape为[B,1,1,1]以匹配图像维度
+        sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, x0.shape)
+        sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x0.shape)
+
+        # 重参数化生成xt
+        return sqrt_alphas_cumprod_t * x0 + sqrt_one_minus_alphas_cumprod_t * noise
+
+    def predict_noise(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """UNet模型预测噪声"""
+        return self.model(x, t)
+
+    def p_sample(self, xt, t):
+        """
+        单步反向采样（推理用）
+        从 xt 预测 xt_prev（t-1时刻图像）
+        """
+        # 获取批次大小
+        batch_size = xt.shape[0]
+
+        # UNet预测当前时刻噪声
+        noise_pred = self.model(xt, t)
+
+        # 提取当前时间步对应的alpha、累积alpha、beta（适配batch维度）
+        alpha_t = self._extract(self.alphas, t, xt.shape)
+        alphas_cumprod_t = self._extract(self.alphas_cumprod, t, xt.shape)
+        betas_t = self._extract(self.betas, t, xt.shape)
+
+        # 计算反向分布的均值（核心公式）
+        mean = (xt - (1 - alpha_t) / torch.sqrt(1 - alphas_cumprod_t + 1e-8) * noise_pred) / torch.sqrt(alpha_t)
+
+        # 方差直接使用beta_t
+        var = betas_t
+        # t=0时刻方差强制为0，不添加噪声
+        var = torch.where(t.reshape(-1, 1, 1, 1) == 0, torch.tensor(0.0, device=xt.device), var)
+
+        # 生成随机噪声，t=0时为0
+        noise = torch.randn_like(xt)
+        noise = torch.where(t.reshape(-1, 1, 1, 1) == 0, torch.zeros_like(xt), noise)
+
+        # 重参数化得到xt_prev
+        return mean + torch.sqrt(var + 1e-8) * noise
+
+    def p_sample_loop(self, batch_size: int) -> torch.Tensor:
+        """
+        完整反向采样循环：从纯高斯噪声生成清晰图像
+        从 T → 0 逐步去噪
+        """
+        # 推理阶段不计算梯度
+        with torch.no_grad():
+            # 初始化纯高斯噪声xt
+            xt = torch.randn(
+                batch_size, self.config.in_channels,
+                self.config.image_size, self.config.image_size,
+                device=self.config.device
             )
-            
-        self.net    = GaussianDiffusion(UNet(3, self.channel), self.input_shape, 3, betas=betas)
 
-        device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.net.load_state_dict(torch.load(self.model_path, map_location=device))
-        self.net    = self.net.eval()
-        print('{} model loaded.'.format(self.model_path))
+            # 从T-1步倒序推理到0步
+            for t in reversed(range(0, self.config.num_timesteps)):
+                # 构造当前批次的时间步张量
+                t_tensor = torch.full((batch_size,), t, device=self.config.device, dtype=torch.long)
+                # 执行单步去噪
+                xt = self.p_sample(xt, t_tensor)
 
-        if self.cuda:
-            self.net = self.net.cuda()
+            # 将输出限制在[-1,1]范围（符合归一化图像格式）
+            return xt.clamp(-1.0, 1.0)
 
-    #---------------------------------------------------#
-    #   Diffusion5x5的图片
-    #---------------------------------------------------#
-    def generate_5x5_image(self, save_path):
-        with torch.no_grad():
-            randn_in    = torch.randn((1, 1)).cuda() if self.cuda else torch.randn((1, 1))
+    def loss(self, x0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        DDPM训练损失：预测噪声与真实噪声的MSE损失
+        这是DDPM最核心的简化损失函数
+        """
+        # 生成真实高斯噪声
+        noise = torch.randn_like(x0)
 
-            test_images = self.net.sample(25, randn_in.device)
+        # 前向扩散：得到xt
+        xt = self.q_sample(x0, t, noise)
 
-            size_figure_grid = 5
-            fig, ax = plt.subplots(size_figure_grid, size_figure_grid, figsize=(5, 5))
-            for i, j in itertools.product(range(size_figure_grid), range(size_figure_grid)):
-                ax[i, j].get_xaxis().set_visible(False)
-                ax[i, j].get_yaxis().set_visible(False)
+        # 模型预测噪声
+        noise_pred = self.predict_noise(xt, t)
 
-            for k in range(5*5):
-                i = k // 5
-                j = k % 5
-                ax[i, j].cla()
-                ax[i, j].imshow(np.uint8(postprocess_output(test_images[k].cpu().data.numpy().transpose(1, 2, 0))))
+        # 计算均方误差损失
+        return F.mse_loss(noise_pred, noise)
 
-            label = 'predict_5x5_results'
-            fig.text(0.5, 0.04, label, ha='center')
-            plt.savefig(save_path)
-
-    #---------------------------------------------------#
-    #   Diffusion1x1的图片
-    #---------------------------------------------------#
-    def generate_1x1_image(self, save_path):
-        with torch.no_grad():
-            randn_in    = torch.randn((1, 1)).cuda() if self.cuda else torch.randn((1, 1))
-
-            test_images = self.net.sample(1, randn_in.device, use_ema=False)
-            test_images = postprocess_output(test_images[0].cpu().data.numpy().transpose(1, 2, 0))
-
-            Image.fromarray(np.uint8(test_images)).save(save_path)
+    def _extract(self, arr: torch.Tensor, t: torch.Tensor, shape: torch.Size) -> torch.Tensor:
+        """
+        工具函数：从一维数组中按时间步t提取对应的值，并reshape为[B,1,1,1]
+        用于匹配图像张量的维度
+        """
+        out = arr.gather(0, t)
+        return out.reshape(shape[0], *([1] * (len(shape) - 1)))
