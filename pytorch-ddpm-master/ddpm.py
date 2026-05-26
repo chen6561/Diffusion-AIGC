@@ -128,6 +128,52 @@ class DDPM(nn.Module):
             # 将输出限制在[-1,1]范围（符合归一化图像格式）
             return xt.clamp(-1.0, 1.0)
 
+    # ======================
+    # 新增：DDIM 加速采样函数
+    # ======================
+    def ddim_sample_loop(
+            self,
+            batch_size: int,
+            num_steps: int = 50,  # DDIM 加速步数
+            eta: float = 0.0  # 0=纯DDIM确定性，1=接近DDPM随机
+    ):
+        # 1. 初始化纯噪声
+        xt = torch.randn(
+            batch_size, self.config.in_channels,
+            self.config.image_size, self.config.image_size,
+            device=self.config.device
+        )
+
+        # 2. 构建等间隔时间步（DDIM核心）
+        total_t = self.config.num_timesteps
+        times = torch.linspace(total_t - 1, 0, num_steps + 1, dtype=torch.long, device=self.config.device)
+        times = list(zip(times[:-1], times[1:]))
+
+        # 3. 开始DDIM加速采样
+        for t, t_prev in times:
+            t_tensor = torch.full((batch_size,), t, device=self.config.device, dtype=torch.long)
+
+            # 模型预测噪声
+            eps = self.model(xt, t_tensor)
+
+            # 取系数
+            at = self.alphas_cumprod[t]
+            at_prev = self.alphas_cumprod[t_prev] if t_prev >= 0 else torch.tensor(1.0, device=self.config.device)
+
+            # DDIM核心公式
+            x0_pred = (xt - torch.sqrt(1 - at) * eps) / torch.sqrt(at)
+            x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
+
+            # 方向项
+            dir_xt = torch.sqrt(1.0 - at_prev - eta ** 2) * eps
+            # 随机噪声项
+            noise = eta * torch.randn_like(xt) if t_prev > 0 else 0.0
+
+            # 更新x
+            xt = torch.sqrt(at_prev) * x0_pred + dir_xt + noise
+
+        return xt.clamp(-1.0, 1.0)
+
     def loss(self, x0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         DDPM训练损失：预测噪声与真实噪声的MSE损失
