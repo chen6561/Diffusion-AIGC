@@ -7,6 +7,10 @@ def setup_dist():
 def dev():
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+def load_state_dict(path, **kwargs):
+    # 单卡 Windows 专用：直接加载模型
+    return torch.load(path, **kwargs)
+
 def rank():
     return 0
 

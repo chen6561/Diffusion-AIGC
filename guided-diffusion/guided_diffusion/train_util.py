@@ -317,21 +317,29 @@ class TrainLoop:
         logger.logkv("samples", (self.step + self.resume_step + 1) * self.global_batch)
 
     def save(self):
-        """保存模型权重（普通模型 + EMA 模型）"""
-        def save_checkpoint(step, params):
-            filename = f"model_{int(step):06d}.pt"
-            save_path = os.path.join("./results", filename)
-            os.makedirs("./results", exist_ok=True)
-            torch.save(params, save_path)
-            print(f"model saved: {save_path}")
+        def save_checkpoint(rate, params):
+            # 原版关键：把 params 转回 state_dict 字典！！！
+            state_dict = self.mp_trainer.master_params_to_state_dict(params)
+            print(f"saving model {rate}...")
+            if not rate:
+                filename = f"model{(self.step + self.resume_step):06d}.pt"
+            else:
+                filename = f"ema_{rate}_{(self.step + self.resume_step):06d}.pt"
 
-        # 当前总步数
-        current_step = self.step + self.resume_step
+            # 保存到本地 results 文件夹
+            os.makedirs("./results", exist_ok=True)
+            save_path = os.path.join("./results", filename)
+            th.save(state_dict, save_path)
+
         # 保存模型
-        save_checkpoint(current_step, self.mp_trainer.master_params)
-        # 保存所有 EMA 模型
+        save_checkpoint(0, self.mp_trainer.master_params)
         for rate, params in zip(self.ema_rate, self.ema_params):
-            save_checkpoint(current_step, params)
+            save_checkpoint(rate, params)
+
+        # 保存优化器
+        os.makedirs("./results", exist_ok=True)
+        opt_path = os.path.join("./results", f"opt{(self.step + self.resume_step):06d}.pt")
+        th.save(self.opt.state_dict(), opt_path)
 
 
 def parse_resume_step_from_filename(filename):

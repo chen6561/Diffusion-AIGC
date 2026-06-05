@@ -159,7 +159,7 @@ def create_argparser():
         ema_rate="0.9999",              # EMA平滑系数
         log_interval=10,                # 日志打印间隔
         save_interval=1000,             # 模型保存间隔
-        resume_checkpoint="",           # 恢复训练的权重路径
+        resume_checkpoint="results/model000000.pt",           # 恢复训练的权重路径
         use_fp16=False,                 # 是否开启半精度训练
         fp16_scale_growth=1e-3,         # 半精度损失缩放增长值
     )
