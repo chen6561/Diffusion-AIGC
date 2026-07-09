@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Train a SwinIR-style multitask model for SR + line-mask prediction.
 
 Input:
@@ -38,11 +38,12 @@ from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 
 
 IMG_EXTENSIONS = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+IGNORED_FILENAMES = {"thumbs.db", ".ds_store", "desktop.ini"}
 
 
 def set_seed(seed: int) -> None:
@@ -59,10 +60,12 @@ def ensure_dir(path: Path) -> None:
 def save_json(path: Path, payload: dict) -> None:
     ensure_dir(path.parent)
     with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
 
 
 def is_image_file(path: Path) -> bool:
+    if path.name.lower() in IGNORED_FILENAMES:
+        return False
     return path.suffix.lower() in IMG_EXTENSIONS
 
 
@@ -80,15 +83,59 @@ def mask_to_tensor(mask: np.ndarray) -> torch.Tensor:
 
 
 def paired_files(lr_dir: Path, hr_dir: Path, mask_dir: Path) -> list[tuple[Path, Path, Path]]:
-    lr_map = {p.name: p for p in lr_dir.iterdir() if p.is_file() and is_image_file(p)}
-    hr_map = {p.name: p for p in hr_dir.iterdir() if p.is_file() and is_image_file(p)}
-    mask_map = {p.name: p for p in mask_dir.iterdir() if p.is_file() and is_image_file(p)}
+    def collect_files(root: Path) -> list[Path]:
+        return sorted([p for p in root.rglob("*") if p.is_file() and is_image_file(p)])
 
-    common = sorted(set(lr_map) & set(hr_map) & set(mask_map))
-    if not common:
-        raise FileNotFoundError("No matched filenames were found across LR / HR / mask directories.")
+    def unique_map(paths: list[Path], key_fn, label: str) -> dict[str, Path]:
+        result: dict[str, Path] = {}
+        duplicates: dict[str, list[str]] = {}
+        for p in paths:
+            key = key_fn(p)
+            if key in result:
+                duplicates.setdefault(key, [str(result[key])]).append(str(p))
+            else:
+                result[key] = p
+        if duplicates:
+            sample = {k: v[:3] for k, v in list(duplicates.items())[:5]}
+            raise ValueError(f"Duplicate {label} keys found: {sample}")
+        return result
 
-    return [(lr_map[name], hr_map[name], mask_map[name]) for name in common]
+    def stem_key(path: Path, is_mask: bool = False) -> str:
+        key = path.stem
+        if is_mask:
+            for suffix in ("_mask", "-mask", "_line", "-line", "_seg", "-seg"):
+                if key.endswith(suffix):
+                    key = key[: -len(suffix)]
+                    break
+        return key
+
+    lr_files = collect_files(lr_dir)
+    hr_files = collect_files(hr_dir)
+    mask_files = collect_files(mask_dir)
+
+    # First try exact filename matching, since many industrial datasets keep names identical.
+    lr_name_map = unique_map(lr_files, lambda p: p.name, "LR filename")
+    hr_name_map = unique_map(hr_files, lambda p: p.name, "HR filename")
+    mask_name_map = unique_map(mask_files, lambda p: p.name, "mask filename")
+    common_names = sorted(set(lr_name_map.keys()) & set(hr_name_map.keys()) & set(mask_name_map.keys()))
+    if common_names:
+        return [(lr_name_map[name], hr_name_map[name], mask_name_map[name]) for name in common_names]
+
+    # Fallback to stem matching for datasets where mask names carry a suffix like "_mask".
+    lr_stem_map = unique_map(lr_files, lambda p: stem_key(p), "LR stem")
+    hr_stem_map = unique_map(hr_files, lambda p: stem_key(p), "HR stem")
+    mask_stem_map = unique_map(mask_files, lambda p: stem_key(p, is_mask=True), "mask stem")
+    common_stems = sorted(set(lr_stem_map.keys()) & set(hr_stem_map.keys()) & set(mask_stem_map.keys()))
+    if common_stems:
+        return [(lr_stem_map[name], hr_stem_map[name], mask_stem_map[name]) for name in common_stems]
+
+    raise FileNotFoundError(
+        "No matched files were found across LR / HR / mask directories. "
+        f"LR={len(lr_files)}, HR={len(hr_files)}, MASK={len(mask_files)}. "
+        f"LR sample names={list(sorted(p.name for p in lr_files))[:5]}, "
+        f"HR sample names={list(sorted(p.name for p in hr_files))[:5]}, "
+        f"MASK sample names={list(sorted(p.name for p in mask_files))[:5]}"
+    )
 
 
 class PairedSRMaskDataset(Dataset):
@@ -105,6 +152,8 @@ class PairedSRMaskDataset(Dataset):
         self.scale = scale
         self.patch_size_lr = patch_size_lr
         self.patch_size_hr = patch_size_lr * scale
+        self.resize_size_lr = 512
+        self.resize_size_hr = self.resize_size_lr * scale
         self.augment = augment
 
     def __len__(self) -> int:
@@ -155,24 +204,68 @@ class PairedSRMaskDataset(Dataset):
             mask = np.rot90(mask).copy()
         return lr, hr, mask
 
+    def _center_crop(self, arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+        h, w = arr.shape
+        if h == target_h and w == target_w:
+            return arr
+        top = max((h - target_h) // 2, 0)
+        left = max((w - target_w) // 2, 0)
+        return arr[top : top + target_h, left : left + target_w]
+
+    def _resize_image(self, arr: np.ndarray, target_h: int, target_w: int, is_mask: bool = False) -> np.ndarray:
+        if arr.shape == (target_h, target_w):
+            return arr
+        resample = Image.Resampling.NEAREST if is_mask else Image.Resampling.BICUBIC
+        pil = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+        resized = pil.resize((target_w, target_h), resample=resample)
+        return np.array(resized, dtype=np.float32)
+
+    def _align_triplet(
+        self,
+        lr: np.ndarray,
+        hr: np.ndarray,
+        mask: np.ndarray,
+        name: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        lr_h, lr_w = lr.shape
+        hr_h, hr_w = hr.shape
+        mask_h, mask_w = mask.shape
+
+        target_hr_h = min(lr_h * self.scale, hr_h, mask_h)
+        target_hr_w = min(lr_w * self.scale, hr_w, mask_w)
+        target_hr_h = (target_hr_h // self.scale) * self.scale
+        target_hr_w = (target_hr_w // self.scale) * self.scale
+
+        if target_hr_h <= 0 or target_hr_w <= 0:
+            raise ValueError(
+                f"Failed to align sample {name}: LR={lr.shape}, HR={hr.shape}, MASK={mask.shape}, scale={self.scale}."
+            )
+
+        target_lr_h = target_hr_h // self.scale
+        target_lr_w = target_hr_w // self.scale
+
+        if target_lr_h <= 0 or target_lr_w <= 0:
+            raise ValueError(
+                f"Aligned LR size became invalid for {name}: target LR {(target_lr_h, target_lr_w)}, target HR {(target_hr_h, target_hr_w)}."
+            )
+
+        lr = self._center_crop(lr, target_lr_h, target_lr_w)
+        hr = self._center_crop(hr, target_hr_h, target_hr_w)
+        mask = self._center_crop(mask, target_hr_h, target_hr_w)
+        return lr, hr, mask
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
         lr_path, hr_path, mask_path = self.items[idx]
         lr = load_grayscale(lr_path)
         hr = load_grayscale(hr_path)
         mask = load_grayscale(mask_path)
 
-        expected_h, expected_w = lr.shape[0] * self.scale, lr.shape[1] * self.scale
-        if hr.shape != (expected_h, expected_w):
-            raise ValueError(
-                f"HR size mismatch for {hr_path.name}: expected {(expected_h, expected_w)}, got {hr.shape}."
-            )
-        if mask.shape != hr.shape:
-            raise ValueError(
-                f"Mask size mismatch for {mask_path.name}: expected {hr.shape}, got {mask.shape}."
-            )
+        lr, hr, mask = self._align_triplet(lr, hr, mask, lr_path.name)
+        lr = self._resize_image(lr, self.resize_size_lr, self.resize_size_lr, is_mask=False)
+        hr = self._resize_image(hr, self.resize_size_hr, self.resize_size_hr, is_mask=False)
+        mask = self._resize_image(mask, self.resize_size_hr, self.resize_size_hr, is_mask=True)
 
         if self.augment:
-            lr, hr, mask = self._random_crop(lr, hr, mask)
             lr, hr, mask = self._augment(lr, hr, mask)
 
         sample = {
@@ -280,11 +373,9 @@ class WindowAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         b_, n, c = x.shape
-        qkv = (
-            self.qkv(x)
-            .reshape(b_, n, 3, self.num_heads, c // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-        )
+        input_dtype = x.dtype
+        qkv = self.qkv(x).float()
+        qkv = qkv.reshape(b_, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         q = q * self.scale
@@ -293,18 +384,20 @@ class WindowAttention(nn.Module):
         relative_position_bias = self.relative_position_bias_table[
             self.relative_position_index.view(-1)
         ].view(n, n, -1)
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous().float()
         attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
             n_w = mask.shape[0]
-            attn = attn.view(b_ // n_w, n_w, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(b_ // n_w, n_w, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0).float()
             attn = attn.view(-1, self.num_heads, n, n)
 
-        attn = F.softmax(attn, dim=-1)
+        attn = attn - attn.amax(dim=-1, keepdim=True)
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32)
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(b_, n, c)
+        x = x.to(input_dtype)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -481,7 +574,9 @@ class UpsampleBlock(nn.Module):
     def __init__(self, scale: int, num_feat: int) -> None:
         super().__init__()
         modules = []
-        if scale in (2, 4, 8):
+        if scale == 1:
+            modules += [nn.Identity()]
+        elif scale in (2, 4, 8):
             for _ in range(int(math.log2(scale))):
                 modules += [nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1), nn.PixelShuffle(2), nn.LeakyReLU(0.1, True)]
         elif scale == 3:
@@ -607,6 +702,8 @@ class DiceLoss(nn.Module):
         self.eps = eps
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        logits = logits.float()
+        target = target.float()
         probs = torch.sigmoid(logits)
         numerator = 2 * (probs * target).sum(dim=(1, 2, 3))
         denominator = probs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) + self.eps
@@ -665,6 +762,8 @@ class SoftCLDiceLoss(nn.Module):
         self.eps = eps
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        logits = logits.float()
+        target = target.float()
         pred = torch.sigmoid(logits)
         pred_skel = soft_skeletonize(pred, self.iterations)
         target_skel = soft_skeletonize(target, self.iterations)
@@ -709,11 +808,47 @@ class TrainConfig:
     mask_loss_weight: float
     edge_loss_weight: float
     topo_loss_weight: float
+    preview_count: int
+    model_size: str
     embed_dim: int
     depths: tuple[int, ...]
     num_heads: tuple[int, ...]
     window_size: int
     checkpoint_every: int
+
+
+SWINIR_MODEL_PRESETS = {
+    "small": {
+        "embed_dim": 60,
+        "depths": (6, 6, 6, 6),
+        "num_heads": (6, 6, 6, 6),
+    },
+    "medium": {
+        "embed_dim": 180,
+        "depths": (6, 6, 6, 6, 6, 6),
+        "num_heads": (6, 6, 6, 6, 6, 6),
+    },
+    "large": {
+        "embed_dim": 240,
+        "depths": (6, 6, 6, 6, 6, 6),
+        "num_heads": (8, 8, 8, 8, 8, 8),
+    },
+}
+
+
+def resolve_model_preset(
+    model_size: str,
+    embed_dim: int,
+    depths: list[int],
+    num_heads: list[int],
+) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+    model_size = model_size.lower()
+    if model_size == "custom":
+        return embed_dim, tuple(depths), tuple(num_heads)
+    if model_size not in SWINIR_MODEL_PRESETS:
+        raise ValueError(f"Unknown --model-size: {model_size}")
+    preset = SWINIR_MODEL_PRESETS[model_size]
+    return preset["embed_dim"], preset["depths"], preset["num_heads"]
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -734,10 +869,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--model-size", type=str, default="small", choices=["small", "medium", "large", "custom"])
     parser.add_argument("--sr-loss-weight", type=float, default=1.0)
     parser.add_argument("--mask-loss-weight", type=float, default=0.5)
     parser.add_argument("--edge-loss-weight", type=float, default=0.2)
     parser.add_argument("--topo-loss-weight", type=float, default=0.2)
+    parser.add_argument("--preview-count", type=int, default=4)
     parser.add_argument("--embed-dim", type=int, default=180)
     parser.add_argument("--depths", type=int, nargs="+", default=[6, 6, 6, 6, 6, 6])
     parser.add_argument("--num-heads", type=int, nargs="+", default=[6, 6, 6, 6, 6, 6])
@@ -748,9 +885,15 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def parse_config() -> TrainConfig:
     args = build_argparser().parse_args()
-    if len(args.depths) != len(args.num_heads):
+    embed_dim, depths, num_heads = resolve_model_preset(
+        args.model_size,
+        args.embed_dim,
+        args.depths,
+        args.num_heads,
+    )
+    if len(depths) != len(num_heads):
         raise ValueError("--depths and --num-heads must have the same length.")
-    if any(depth <= 0 for depth in args.depths):
+    if any(depth <= 0 for depth in depths):
         raise ValueError("All depths must be positive.")
     return TrainConfig(
         train_lr_dir=args.train_lr_dir,
@@ -769,13 +912,15 @@ def parse_config() -> TrainConfig:
         num_workers=args.num_workers,
         seed=args.seed,
         amp=args.amp,
+        model_size=args.model_size,
         sr_loss_weight=args.sr_loss_weight,
         mask_loss_weight=args.mask_loss_weight,
         edge_loss_weight=args.edge_loss_weight,
         topo_loss_weight=args.topo_loss_weight,
-        embed_dim=args.embed_dim,
-        depths=tuple(args.depths),
-        num_heads=tuple(args.num_heads),
+        preview_count=args.preview_count,
+        embed_dim=embed_dim,
+        depths=depths,
+        num_heads=num_heads,
         window_size=args.window_size,
         checkpoint_every=args.checkpoint_every,
     )
@@ -834,6 +979,26 @@ def mask_iou(logits: torch.Tensor, target: torch.Tensor) -> float:
     return inter / max(union, 1.0)
 
 
+def tensor_to_uint8_image(x: torch.Tensor) -> np.ndarray:
+    x = x.detach().float().cpu().squeeze().clamp(0, 1).numpy()
+    return np.clip(x * 255.0, 0, 255).astype(np.uint8)
+
+
+def save_preview_triptych(output_path: Path, lr: torch.Tensor, sr: torch.Tensor, hr: torch.Tensor) -> None:
+    ensure_dir(output_path.parent)
+    lr_img = tensor_to_uint8_image(lr)
+    sr_img = tensor_to_uint8_image(sr)
+    hr_img = tensor_to_uint8_image(hr)
+
+    if lr_img.shape != sr_img.shape:
+        lr_img = np.array(Image.fromarray(lr_img).resize((sr_img.shape[1], sr_img.shape[0]), Image.Resampling.NEAREST))
+    if hr_img.shape != sr_img.shape:
+        hr_img = np.array(Image.fromarray(hr_img).resize((sr_img.shape[1], sr_img.shape[0]), Image.Resampling.NEAREST))
+
+    canvas = np.concatenate([lr_img, sr_img, hr_img], axis=1)
+    Image.fromarray(canvas).save(output_path)
+
+
 def validate(
     model: nn.Module,
     loader: DataLoader,
@@ -843,10 +1008,13 @@ def validate(
     edge_loss_fn: nn.Module,
     topo_loss_fn: nn.Module,
     cfg: TrainConfig,
+    epoch: int | None = None,
 ) -> dict[str, float]:
     model.eval()
     totals = {"loss": 0.0, "psnr": 0.0, "iou": 0.0}
     count = 0
+    preview_limit = max(cfg.preview_count, 0)
+    preview_saved_count = 0
     with torch.no_grad():
         for batch in loader:
             lr = batch["lr"].to(device, non_blocking=True)
@@ -854,10 +1022,10 @@ def validate(
             mask = batch["mask"].to(device, non_blocking=True)
             sr_pred, mask_logits = model(lr)
 
-            sr_loss = sr_loss_fn(sr_pred, hr)
-            mask_loss = mask_loss_fn(mask_logits, mask)
-            edge_loss = edge_loss_fn(sr_pred, hr)
-            topo_loss = topo_loss_fn(mask_logits, mask)
+            sr_loss = sr_loss_fn(sr_pred.float(), hr.float())
+            mask_loss = mask_loss_fn(mask_logits.float(), mask.float())
+            edge_loss = edge_loss_fn(sr_pred.float(), hr.float())
+            topo_loss = topo_loss_fn(mask_logits.float(), mask.float())
             loss = (
                 cfg.sr_loss_weight * sr_loss
                 + cfg.mask_loss_weight * mask_loss
@@ -869,6 +1037,19 @@ def validate(
             totals["psnr"] += psnr(sr_pred.clamp(0, 1), hr)
             totals["iou"] += mask_iou(mask_logits, mask)
             count += 1
+
+            if preview_saved_count < preview_limit:
+                batch_names = batch.get("name", [])
+                max_items = min(lr.shape[0], preview_limit - preview_saved_count)
+                for i in range(max_items):
+                    sample_name = batch_names[i] if i < len(batch_names) else f"sample_{count:04d}_{i:02d}"
+                    sample_stem = Path(sample_name).stem
+                    preview_name = f"epoch_{(epoch or 0):04d}_{preview_saved_count + 1:02d}_{sample_stem}.png"
+                    preview_path = cfg.output_dir / "val_previews" / preview_name
+                    save_preview_triptych(preview_path, lr[i], sr_pred[i].clamp(0, 1), hr[i])
+                    preview_saved_count += 1
+                    if preview_saved_count >= preview_limit:
+                        break
 
     return {k: v / max(count, 1) for k, v in totals.items()}
 
@@ -904,6 +1085,9 @@ def train() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(
+        f"Model preset: {cfg.model_size} | embed_dim={cfg.embed_dim} | depths={cfg.depths} | num_heads={cfg.num_heads}"
+    )
 
     train_loader, val_loader = build_loaders(cfg)
     model = SwinIRMultiTask(
@@ -917,14 +1101,14 @@ def train() -> None:
         scale=cfg.scale,
     ).to(device)
 
-    sr_loss_fn = CharbonnierLoss()
-    mask_loss_fn = CombinedMaskLoss()
-    edge_loss_fn = EdgeLoss()
-    topo_loss_fn = SoftCLDiceLoss(iterations=10)
+    sr_loss_fn = CharbonnierLoss().to(device)
+    mask_loss_fn = CombinedMaskLoss().to(device)
+    edge_loss_fn = EdgeLoss().to(device)
+    topo_loss_fn = SoftCLDiceLoss(iterations=10).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-6)
-    scaler = GradScaler(enabled=cfg.amp and device.type == "cuda")
+    scaler = GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
 
     best_val_loss = None
     history: list[dict[str, float | int]] = []
@@ -936,6 +1120,9 @@ def train() -> None:
         epoch_mask_loss = 0.0
         epoch_edge_loss = 0.0
         epoch_topo_loss = 0.0
+        valid_batches = 0
+        skipped_batches = 0
+        train_preview_saved_count = 0
         start_t = time.time()
 
         for batch in train_loader:
@@ -944,23 +1131,59 @@ def train() -> None:
             mask = batch["mask"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=cfg.amp and device.type == "cuda"):
+            with autocast("cuda", enabled=cfg.amp and device.type == "cuda"): 
                 sr_pred, mask_logits = model(lr)
-                sr_loss = sr_loss_fn(sr_pred, hr)
-                mask_loss = mask_loss_fn(mask_logits, mask)
-                edge_loss = edge_loss_fn(sr_pred, hr)
-                topo_loss = topo_loss_fn(mask_logits, mask)
-                loss = (
-                    cfg.sr_loss_weight * sr_loss
-                    + cfg.mask_loss_weight * mask_loss
-                    + cfg.edge_loss_weight * edge_loss
-                    + cfg.topo_loss_weight * topo_loss
+
+            if not torch.isfinite(sr_pred).all() or not torch.isfinite(mask_logits).all():
+                skipped_batches += 1
+                bad_names = batch.get("name", [])
+                print(f"Skipping non-finite model output: names={bad_names}")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            sr_pred_loss = sr_pred.float()
+            mask_logits_loss = mask_logits.float()
+            hr_loss = hr.float()
+            mask_loss_target = mask.float()
+
+            sr_loss = sr_loss_fn(sr_pred_loss, hr_loss)
+            mask_loss = mask_loss_fn(mask_logits_loss, mask_loss_target)
+            edge_loss = edge_loss_fn(sr_pred_loss, hr_loss)
+            topo_loss = topo_loss_fn(mask_logits_loss, mask_loss_target)
+            loss = (
+                cfg.sr_loss_weight * sr_loss
+                + cfg.mask_loss_weight * mask_loss
+                + cfg.edge_loss_weight * edge_loss
+                + cfg.topo_loss_weight * topo_loss
+            )
+
+            if not torch.isfinite(loss):
+                skipped_batches += 1
+                bad_names = batch.get("name", [])
+                print(
+                    f"Skipping non-finite batch: names={bad_names} sr={sr_loss.item()} mask={mask_loss.item()} edge={edge_loss.item()} topo={topo_loss.item()} total={loss.item()}"
                 )
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
+            if val_loader is None and train_preview_saved_count < max(cfg.preview_count, 0):
+                batch_names = batch.get("name", [])
+                max_items = min(lr.shape[0], max(cfg.preview_count, 0) - train_preview_saved_count)
+                for i in range(max_items):
+                    sample_name = batch_names[i] if i < len(batch_names) else f"train_sample_{epoch:04d}_{valid_batches:04d}_{i:02d}"
+                    sample_stem = Path(sample_name).stem
+                    preview_name = f"epoch_{epoch:04d}_{train_preview_saved_count + 1:02d}_{sample_stem}.png"
+                    preview_path = cfg.output_dir / "train_previews" / preview_name
+                    save_preview_triptych(preview_path, lr[i], sr_pred[i].clamp(0, 1), hr[i])
+                    train_preview_saved_count += 1
+                    if train_preview_saved_count >= max(cfg.preview_count, 0):
+                        break
+
+            valid_batches += 1
             epoch_loss += loss.item()
             epoch_sr_loss += sr_loss.item()
             epoch_mask_loss += mask_loss.item()
@@ -968,7 +1191,7 @@ def train() -> None:
             epoch_topo_loss += topo_loss.item()
 
         scheduler.step()
-        num_batches = max(len(train_loader), 1)
+        num_batches = max(valid_batches, 1)
         train_metrics = {
             "epoch": epoch,
             "train_loss": epoch_loss / num_batches,
@@ -976,6 +1199,8 @@ def train() -> None:
             "train_mask_loss": epoch_mask_loss / num_batches,
             "train_edge_loss": epoch_edge_loss / num_batches,
             "train_topo_loss": epoch_topo_loss / num_batches,
+            "valid_batches": valid_batches,
+            "skipped_batches": skipped_batches,
             "lr": optimizer.param_groups[0]["lr"],
             "seconds": time.time() - start_t,
         }
@@ -990,6 +1215,7 @@ def train() -> None:
                 edge_loss_fn=edge_loss_fn,
                 topo_loss_fn=topo_loss_fn,
                 cfg=cfg,
+                epoch=epoch,
             )
             train_metrics.update(
                 {
@@ -1048,3 +1274,18 @@ def train() -> None:
 
 if __name__ == "__main__":
     train()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
