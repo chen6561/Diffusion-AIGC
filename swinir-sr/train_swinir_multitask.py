@@ -38,8 +38,14 @@ from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from networks_rcan import RCANITMultiTask, RCANMultiTask
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 
 IMG_EXTENSIONS = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
@@ -190,18 +196,6 @@ class PairedSRMaskDataset(Dataset):
         hr: np.ndarray,
         mask: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if random.random() < 0.5:
-            lr = np.fliplr(lr).copy()
-            hr = np.fliplr(hr).copy()
-            mask = np.fliplr(mask).copy()
-        if random.random() < 0.5:
-            lr = np.flipud(lr).copy()
-            hr = np.flipud(hr).copy()
-            mask = np.flipud(mask).copy()
-        if random.random() < 0.5:
-            lr = np.rot90(lr).copy()
-            hr = np.rot90(hr).copy()
-            mask = np.rot90(mask).copy()
         return lr, hr, mask
 
     def _center_crop(self, arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
@@ -804,12 +798,16 @@ class TrainConfig:
     num_workers: int
     seed: int
     amp: bool
+    multi_gpu: bool
+    device_ids: str
     sr_loss_weight: float
     mask_loss_weight: float
     edge_loss_weight: float
     topo_loss_weight: float
     preview_count: int
+    network: str
     model_size: str
+    reduction: int
     embed_dim: int
     depths: tuple[int, ...]
     num_heads: tuple[int, ...]
@@ -817,38 +815,41 @@ class TrainConfig:
     checkpoint_every: int
 
 
-SWINIR_MODEL_PRESETS = {
-    "small": {
-        "embed_dim": 60,
-        "depths": (6, 6, 6, 6),
-        "num_heads": (6, 6, 6, 6),
+MODEL_PRESETS = {
+    "swinir": {
+        "small": {"embed_dim": 60, "depths": (6, 6, 6, 6), "num_heads": (6, 6, 6, 6), "reduction": 16},
+        "medium": {"embed_dim": 180, "depths": (6, 6, 6, 6, 6, 6), "num_heads": (6, 6, 6, 6, 6, 6), "reduction": 16},
+        "large": {"embed_dim": 240, "depths": (6, 6, 6, 6, 6, 6), "num_heads": (8, 8, 8, 8, 8, 8), "reduction": 16},
     },
-    "medium": {
-        "embed_dim": 180,
-        "depths": (6, 6, 6, 6, 6, 6),
-        "num_heads": (6, 6, 6, 6, 6, 6),
+    "rcan": {
+        "small": {"embed_dim": 32, "depths": (6, 6, 6, 6), "num_heads": (1, 1, 1, 1), "reduction": 8},
+        "medium": {"embed_dim": 48, "depths": (10, 10, 10, 10, 10, 10), "num_heads": (1, 1, 1, 1, 1, 1), "reduction": 12},
+        "large": {"embed_dim": 64, "depths": (20, 20, 20, 20, 20, 20, 20, 20, 20, 20), "num_heads": (1, 1, 1, 1, 1, 1, 1, 1, 1, 1), "reduction": 16},
     },
-    "large": {
-        "embed_dim": 240,
-        "depths": (6, 6, 6, 6, 6, 6),
-        "num_heads": (8, 8, 8, 8, 8, 8),
+    "rcan_it": {
+        "small": {"embed_dim": 32, "depths": (6, 6, 6, 6), "num_heads": (1, 1, 1, 1), "reduction": 8},
+        "medium": {"embed_dim": 48, "depths": (10, 10, 10, 10, 10, 10), "num_heads": (1, 1, 1, 1, 1, 1), "reduction": 12},
+        "large": {"embed_dim": 64, "depths": (20, 20, 20, 20, 20, 20, 20, 20, 20, 20), "num_heads": (1, 1, 1, 1, 1, 1, 1, 1, 1, 1), "reduction": 16},
     },
 }
 
 
 def resolve_model_preset(
+    network: str,
     model_size: str,
     embed_dim: int,
     depths: list[int],
     num_heads: list[int],
-) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+    reduction: int,
+) -> tuple[int, tuple[int, ...], tuple[int, ...], int]:
+    network = network.lower()
     model_size = model_size.lower()
     if model_size == "custom":
-        return embed_dim, tuple(depths), tuple(num_heads)
-    if model_size not in SWINIR_MODEL_PRESETS:
-        raise ValueError(f"Unknown --model-size: {model_size}")
-    preset = SWINIR_MODEL_PRESETS[model_size]
-    return preset["embed_dim"], preset["depths"], preset["num_heads"]
+        return embed_dim, tuple(depths), tuple(num_heads), reduction
+    if network not in MODEL_PRESETS or model_size not in MODEL_PRESETS[network]:
+        raise ValueError(f"Unknown preset: network={network}, model_size={model_size}")
+    preset = MODEL_PRESETS[network][model_size]
+    return preset["embed_dim"], preset["depths"], preset["num_heads"], preset["reduction"]
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -869,12 +870,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--multi-gpu", action="store_true")
+    parser.add_argument("--device-ids", type=str, default="")
+    parser.add_argument("--network", type=str, default="rcan", choices=["rcan", "rcan_it", "swinir"])
     parser.add_argument("--model-size", type=str, default="small", choices=["small", "medium", "large", "custom"])
     parser.add_argument("--sr-loss-weight", type=float, default=1.0)
     parser.add_argument("--mask-loss-weight", type=float, default=0.5)
     parser.add_argument("--edge-loss-weight", type=float, default=0.2)
     parser.add_argument("--topo-loss-weight", type=float, default=0.2)
     parser.add_argument("--preview-count", type=int, default=4)
+    parser.add_argument("--reduction", type=int, default=16)
     parser.add_argument("--embed-dim", type=int, default=180)
     parser.add_argument("--depths", type=int, nargs="+", default=[6, 6, 6, 6, 6, 6])
     parser.add_argument("--num-heads", type=int, nargs="+", default=[6, 6, 6, 6, 6, 6])
@@ -885,11 +890,13 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def parse_config() -> TrainConfig:
     args = build_argparser().parse_args()
-    embed_dim, depths, num_heads = resolve_model_preset(
+    embed_dim, depths, num_heads, reduction = resolve_model_preset(
+        args.network,
         args.model_size,
         args.embed_dim,
         args.depths,
         args.num_heads,
+        args.reduction,
     )
     if len(depths) != len(num_heads):
         raise ValueError("--depths and --num-heads must have the same length.")
@@ -912,7 +919,11 @@ def parse_config() -> TrainConfig:
         num_workers=args.num_workers,
         seed=args.seed,
         amp=args.amp,
+        multi_gpu=args.multi_gpu,
+        device_ids=args.device_ids,
+        network=args.network,
         model_size=args.model_size,
+        reduction=reduction,
         sr_loss_weight=args.sr_loss_weight,
         mask_loss_weight=args.mask_loss_weight,
         edge_loss_weight=args.edge_loss_weight,
@@ -984,7 +995,27 @@ def tensor_to_uint8_image(x: torch.Tensor) -> np.ndarray:
     return np.clip(x * 255.0, 0, 255).astype(np.uint8)
 
 
-def save_preview_triptych(output_path: Path, lr: torch.Tensor, sr: torch.Tensor, hr: torch.Tensor) -> None:
+def logits_to_mask_uint8(x: torch.Tensor) -> np.ndarray:
+    x = (torch.sigmoid(x.detach().float().cpu()) > 0.5).float().squeeze().numpy()
+    return np.clip(x * 255.0, 0, 255).astype(np.uint8)
+
+
+def save_mask_preview_triptych(output_path: Path, lr: torch.Tensor, mask_logits: torch.Tensor, mask_target: torch.Tensor) -> None:
+    ensure_dir(output_path.parent)
+    lr_img = tensor_to_uint8_image(lr)
+    pred_mask_img = logits_to_mask_uint8(mask_logits)
+    gt_mask_img = tensor_to_uint8_image(mask_target)
+
+    if lr_img.shape != pred_mask_img.shape:
+        lr_img = np.array(Image.fromarray(lr_img).resize((pred_mask_img.shape[1], pred_mask_img.shape[0]), Image.Resampling.NEAREST))
+    if gt_mask_img.shape != pred_mask_img.shape:
+        gt_mask_img = np.array(Image.fromarray(gt_mask_img).resize((pred_mask_img.shape[1], pred_mask_img.shape[0]), Image.Resampling.NEAREST))
+
+    canvas = np.concatenate([lr_img, pred_mask_img, gt_mask_img], axis=1)
+    Image.fromarray(canvas).save(output_path)
+
+
+def save_sr_preview_triptych(output_path: Path, lr: torch.Tensor, sr: torch.Tensor, hr: torch.Tensor) -> None:
     ensure_dir(output_path.parent)
     lr_img = tensor_to_uint8_image(lr)
     sr_img = tensor_to_uint8_image(sr)
@@ -997,6 +1028,28 @@ def save_preview_triptych(output_path: Path, lr: torch.Tensor, sr: torch.Tensor,
 
     canvas = np.concatenate([lr_img, sr_img, hr_img], axis=1)
     Image.fromarray(canvas).save(output_path)
+
+
+def parse_device_ids(device_ids: str, cuda_count: int) -> list[int]:
+    if cuda_count <= 0:
+        return []
+    if not device_ids.strip():
+        return list(range(cuda_count))
+    parsed = [int(x.strip()) for x in device_ids.split(",") if x.strip()]
+    valid = [idx for idx in parsed if 0 <= idx < cuda_count]
+    if not valid:
+        raise ValueError(f"No valid device ids in --device-ids={device_ids!r}. Available cuda devices: 0..{cuda_count - 1}")
+    return valid
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def make_progress(iterable, total: int | None = None, desc: str = "", leave: bool = False):
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc, leave=leave, dynamic_ncols=True)
 
 
 def validate(
@@ -1016,7 +1069,8 @@ def validate(
     preview_limit = max(cfg.preview_count, 0)
     preview_saved_count = 0
     with torch.no_grad():
-        for batch in loader:
+        progress = make_progress(loader, total=len(loader), desc=f"Val {epoch or 0:03d}", leave=False)
+        for batch in progress:
             lr = batch["lr"].to(device, non_blocking=True)
             hr = batch["hr"].to(device, non_blocking=True)
             mask = batch["mask"].to(device, non_blocking=True)
@@ -1037,6 +1091,8 @@ def validate(
             totals["psnr"] += psnr(sr_pred.clamp(0, 1), hr)
             totals["iou"] += mask_iou(mask_logits, mask)
             count += 1
+            if tqdm is not None:
+                progress.set_postfix(loss=f"{loss.item():.4f}", psnr=f"{totals['psnr'] / max(count, 1):.2f}", iou=f"{totals['iou'] / max(count, 1):.4f}")
 
             if preview_saved_count < preview_limit:
                 batch_names = batch.get("name", [])
@@ -1046,7 +1102,9 @@ def validate(
                     sample_stem = Path(sample_name).stem
                     preview_name = f"epoch_{(epoch or 0):04d}_{preview_saved_count + 1:02d}_{sample_stem}.png"
                     preview_path = cfg.output_dir / "val_previews" / preview_name
-                    save_preview_triptych(preview_path, lr[i], sr_pred[i].clamp(0, 1), hr[i])
+                    save_mask_preview_triptych(preview_path, lr[i], mask_logits[i], mask[i])
+                    legacy_preview_path = cfg.output_dir / "val_mask_previews" / preview_name
+                    save_mask_preview_triptych(legacy_preview_path, lr[i], mask_logits[i], mask[i])
                     preview_saved_count += 1
                     if preview_saved_count >= preview_limit:
                         break
@@ -1067,7 +1125,7 @@ def save_checkpoint(
     torch.save(
         {
             "epoch": epoch,
-            "model": model.state_dict(),
+            "model": unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
             "config": asdict(cfg),
@@ -1083,23 +1141,59 @@ def train() -> None:
     save_json(cfg.output_dir / "config.json", asdict(cfg))
     set_seed(cfg.seed)
 
+    cuda_count = torch.cuda.device_count()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(
-        f"Model preset: {cfg.model_size} | embed_dim={cfg.embed_dim} | depths={cfg.depths} | num_heads={cfg.num_heads}"
+        f"Network: {cfg.network} | preset: {cfg.model_size} | embed_dim={cfg.embed_dim} | depths={cfg.depths} | num_heads={cfg.num_heads} | reduction={cfg.reduction}"
     )
 
     train_loader, val_loader = build_loaders(cfg)
-    model = SwinIRMultiTask(
-        in_chans=1,
-        out_chans=1,
-        mask_chans=1,
-        embed_dim=cfg.embed_dim,
-        depths=cfg.depths,
-        num_heads=cfg.num_heads,
-        window_size=cfg.window_size,
-        scale=cfg.scale,
-    ).to(device)
+    if cfg.network == "swinir":
+        model = SwinIRMultiTask(
+            in_chans=1,
+            out_chans=1,
+            mask_chans=1,
+            embed_dim=cfg.embed_dim,
+            depths=cfg.depths,
+            num_heads=cfg.num_heads,
+            window_size=cfg.window_size,
+            scale=cfg.scale,
+        )
+    elif cfg.network == "rcan":
+        model = RCANMultiTask(
+            in_chans=1,
+            out_chans=1,
+            mask_chans=1,
+            scale=cfg.scale,
+            num_feat=cfg.embed_dim,
+            num_groups=len(cfg.depths),
+            num_blocks=cfg.depths[0],
+            reduction=cfg.reduction,
+        )
+    elif cfg.network == "rcan_it":
+        model = RCANITMultiTask(
+            in_chans=1,
+            out_chans=1,
+            mask_chans=1,
+            scale=cfg.scale,
+            num_feat=cfg.embed_dim,
+            num_groups=len(cfg.depths),
+            num_blocks=cfg.depths[0],
+            reduction=cfg.reduction,
+            iter_steps=2,
+        )
+    else:
+        raise ValueError(f"Unsupported network: {cfg.network}")
+    model = model.to(device)
+
+    if cfg.multi_gpu and device.type == "cuda":
+        device_ids = parse_device_ids(cfg.device_ids, cuda_count)
+        if len(device_ids) > 1:
+            model = nn.DataParallel(model, device_ids=device_ids)
+            print(f"Using DataParallel on GPUs: {device_ids}")
+        else:
+            print(f"Multi-GPU requested, but active GPU count is {len(device_ids)}. Falling back to single GPU.")
 
     sr_loss_fn = CharbonnierLoss().to(device)
     mask_loss_fn = CombinedMaskLoss().to(device)
@@ -1125,7 +1219,8 @@ def train() -> None:
         train_preview_saved_count = 0
         start_t = time.time()
 
-        for batch in train_loader:
+        progress = make_progress(train_loader, total=len(train_loader), desc=f"Train {epoch:03d}", leave=False)
+        for batch in progress:
             lr = batch["lr"].to(device, non_blocking=True)
             hr = batch["hr"].to(device, non_blocking=True)
             mask = batch["mask"].to(device, non_blocking=True)
@@ -1137,7 +1232,10 @@ def train() -> None:
             if not torch.isfinite(sr_pred).all() or not torch.isfinite(mask_logits).all():
                 skipped_batches += 1
                 bad_names = batch.get("name", [])
-                print(f"Skipping non-finite model output: names={bad_names}")
+                if tqdm is not None:
+                    progress.write(f"Skipping non-finite model output: names={bad_names}")
+                else:
+                    print(f"Skipping non-finite model output: names={bad_names}")
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
@@ -1160,9 +1258,11 @@ def train() -> None:
             if not torch.isfinite(loss):
                 skipped_batches += 1
                 bad_names = batch.get("name", [])
-                print(
-                    f"Skipping non-finite batch: names={bad_names} sr={sr_loss.item()} mask={mask_loss.item()} edge={edge_loss.item()} topo={topo_loss.item()} total={loss.item()}"
-                )
+                msg = f"Skipping non-finite batch: names={bad_names} sr={sr_loss.item()} mask={mask_loss.item()} edge={edge_loss.item()} topo={topo_loss.item()} total={loss.item()}"
+                if tqdm is not None:
+                    progress.write(msg)
+                else:
+                    print(msg)
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
@@ -1177,8 +1277,10 @@ def train() -> None:
                     sample_name = batch_names[i] if i < len(batch_names) else f"train_sample_{epoch:04d}_{valid_batches:04d}_{i:02d}"
                     sample_stem = Path(sample_name).stem
                     preview_name = f"epoch_{epoch:04d}_{train_preview_saved_count + 1:02d}_{sample_stem}.png"
-                    preview_path = cfg.output_dir / "train_previews" / preview_name
-                    save_preview_triptych(preview_path, lr[i], sr_pred[i].clamp(0, 1), hr[i])
+                    sr_preview_path = cfg.output_dir / "train_sr_previews" / preview_name
+                    save_sr_preview_triptych(sr_preview_path, lr[i], sr_pred[i].clamp(0, 1), hr[i])
+                    mask_preview_path = cfg.output_dir / "train_mask_previews" / preview_name
+                    save_mask_preview_triptych(mask_preview_path, lr[i], mask_logits[i], mask[i])
                     train_preview_saved_count += 1
                     if train_preview_saved_count >= max(cfg.preview_count, 0):
                         break
@@ -1189,6 +1291,15 @@ def train() -> None:
             epoch_mask_loss += mask_loss.item()
             epoch_edge_loss += edge_loss.item()
             epoch_topo_loss += topo_loss.item()
+            if tqdm is not None:
+                progress.set_postfix(
+                    loss=f"{epoch_loss / max(valid_batches, 1):.4f}",
+                    sr=f"{epoch_sr_loss / max(valid_batches, 1):.4f}",
+                    mask=f"{epoch_mask_loss / max(valid_batches, 1):.4f}",
+                    edge=f"{epoch_edge_loss / max(valid_batches, 1):.4f}",
+                    topo=f"{epoch_topo_loss / max(valid_batches, 1):.4f}",
+                    skip=skipped_batches,
+                )
 
         scheduler.step()
         num_batches = max(valid_batches, 1)
@@ -1242,16 +1353,15 @@ def train() -> None:
         history.append(train_metrics)
         save_json(cfg.output_dir / "history.json", {"history": history})
 
-        if epoch % cfg.checkpoint_every == 0 or epoch == cfg.epochs:
-            save_checkpoint(
-                cfg.output_dir / f"checkpoint_epoch_{epoch:04d}.pth",
-                model,
-                optimizer,
-                scaler,
-                epoch,
-                cfg,
-                best_val_loss,
-            )
+        save_checkpoint(
+            cfg.output_dir / f"checkpoint_epoch_{epoch:04d}.pth",
+            model,
+            optimizer,
+            scaler,
+            epoch,
+            cfg,
+            best_val_loss,
+        )
 
         status = (
             f"Epoch {epoch:03d}/{cfg.epochs} "
@@ -1274,6 +1384,14 @@ def train() -> None:
 
 if __name__ == "__main__":
     train()
+
+
+
+
+
+
+
+
 
 
 
